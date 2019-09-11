@@ -8,12 +8,12 @@
     The plugin will receive a dict containing:
     {"filename": <filename of source frame>,
      "image": <source image>,
-     "detected_faces": <list of BoundingBoxes>}
+     "detected_faces": <list of bounding box dicts as defined in lib/plugins/extract/detect/_base>}
 
     For each source item, the plugin must pass a dict to finalize containing:
     {"filename": <filename of source frame>,
      "image": <source image>,
-     "detected_faces": <list of BoundingBoxes>, (Class defined in /lib/faces_detect)
+     "detected_faces": <list of bounding box dicts as defined in lib/plugins/extract/detect/_base>,
      "landmarks": <list of landmarks>}
     """
 
@@ -59,6 +59,10 @@ class Aligner():
         # how many parallel processes / batches can be run.
         # Be conservative to avoid OOM.
         self.vram = None
+
+        # Set to true if the plugin supports PlaidML
+        self.supports_plaidml = False
+
         logger.debug("Initialized %s", self.__class__.__name__)
 
     # <<< OVERRIDE METHODS >>> #
@@ -218,11 +222,10 @@ class Aligner():
         self.queues["out"].put((output))
 
     # <<< MISC METHODS >>> #
-    @staticmethod
-    def get_vram_free():
+    def get_vram_free(self):
         """ Return free and total VRAM on card with most VRAM free"""
         stats = GPUStats()
-        vram = stats.get_card_most_free()
+        vram = stats.get_card_most_free(supports_plaidml=self.supports_plaidml)
         logger.verbose("Using device %s with %sMB free of %sMB",
                        vram["device"],
                        int(vram["free"]),

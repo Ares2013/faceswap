@@ -8,7 +8,9 @@
     For each source frame, the plugin must pass a dict to finalize containing:
     {"filename": <filename of source frame>,
      "image": <source image>,
-     "detected_faces": <list of BoundingBoxes>} (Class defined in /lib/faces_detect)
+     "detected_faces": <list of dicts containing bounding box points>}}
+
+    - Use the function self.to_bounding_box_dict(left, right, top, bottom) to define the dict
     """
 
 import logging
@@ -18,7 +20,6 @@ from io import StringIO
 
 import cv2
 
-from lib.faces_detect import BoundingBox
 from lib.gpu_stats import GPUStats
 from lib.utils import rotate_landmarks, GetModel
 from plugins.extract._config import Config
@@ -33,7 +34,7 @@ def get_config(plugin_name, configfile=None):
 
 class Detector():
     """ Detector object """
-    def __init__(self, loglevel, configfile=None,
+    def __init__(self, loglevel, configfile=None,  # pylint:disable=too-many-arguments
                  git_model_id=None, model_filename=None, rotation=None, min_size=0):
         logger.debug("Initializing %s: (loglevel: %s, configfile: %s, git_model_id: %s, "
                      "model_filename: %s, rotation: %s, min_size: %s)",
@@ -63,6 +64,9 @@ class Detector():
         # Be conservative to avoid OOM.
         self.vram = None
 
+        # Set to true if the plugin supports PlaidML
+        self.supports_plaidml = False
+
         # For detectors that support batching, this should be set to
         # the calculated batch size that the amount of available VRAM
         # will support. It is also used for holding the number of threads/
@@ -85,7 +89,7 @@ class Detector():
     def detect_faces(self, *args, **kwargs):
         """ Detect faces in rgb image
             Override for specific detector
-            Must return a list of BoundingBox's"""
+            Must return a list of bounding box dicts (See module docstring)"""
         try:
             if not self.init:
                 self.initialize(*args, **kwargs)
@@ -137,6 +141,13 @@ class Detector():
             logger.trace("Item out: %s", {key: val
                                           for key, val in output.items()
                                           if key != "image"})
+            # Prevent zero size faces
+            iheight, iwidth = output["image"].shape[:2]
+            output["detected_faces"] = [
+                f for f in output.get("detected_faces", list())
+                if f["right"] > 0 and f["left"] < iwidth
+                and f["bottom"] > 0 and f["top"] < iheight
+            ]
             if self.min_size > 0 and output.get("detected_faces", None):
                 output["detected_faces"] = self.filter_small_faces(output["detected_faces"])
         else:
@@ -147,7 +158,9 @@ class Detector():
         """ Filter out any faces smaller than the min size threshold """
         retval = list()
         for face in detected_faces:
-            face_size = (face.width ** 2 + face.height ** 2) ** 0.5
+            width = face["right"] - face["left"]
+            height = face["bottom"] - face["top"]
+            face_size = (width ** 2 + height ** 2) ** 0.5
             if face_size < self.min_size:
                 logger.debug("Removing detected face: (face_size: %s, min_size: %s",
                              face_size, self.min_size)
@@ -156,8 +169,9 @@ class Detector():
         return retval
 
     # <<< DETECTION IMAGE COMPILATION METHODS >>> #
-    def compile_detection_image(self, input_image,
-                                is_square=False, scale_up=False, to_rgb=False, to_grayscale=False):
+    def compile_detection_image(self, input_image,  # pylint:disable=too-many-arguments
+                                is_square=False, scale_up=False, to_rgb=False,
+                                to_grayscale=False, pad_to=None):
         """ Compile the detection image """
         image = input_image.copy()
         if to_rgb:
@@ -165,8 +179,12 @@ class Detector():
         elif to_grayscale:
             image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)  # pylint: disable=no-member
         scale = self.set_scale(image, is_square=is_square, scale_up=scale_up)
-        image = self.scale_image(image, scale)
-        return [image, scale]
+        image = self.scale_image(image, scale, pad_to)
+        if pad_to is None:
+            return [image, scale]
+        pad_left = int(pad_to[0] - int(input_image.shape[1] * scale)) // 2
+        pad_top = int(pad_to[1] - int(input_image.shape[0] * scale)) // 2
+        return [image, scale, (pad_left, pad_top)]
 
     def set_scale(self, image, is_square=False, scale_up=False):
         """ Set the scale factor for incoming image """
@@ -192,21 +210,35 @@ class Detector():
         return scale
 
     @staticmethod
-    def scale_image(image, scale):
-        """ Scale the image """
+    def scale_image(image, scale, pad_to=None):
+        """ Scale the image and optional pad to given size """
         # pylint: disable=no-member
-        if scale == 1.0:
-            return image
-
         height, width = image.shape[:2]
         interpln = cv2.INTER_LINEAR if scale > 1.0 else cv2.INTER_AREA
-        dims = (int(width * scale), int(height * scale))
+        if scale != 1.0:
+            dims = (int(width * scale), int(height * scale))
+            if scale < 1.0:
+                logger.debug("Resizing image from %sx%s to %s. Scale=%s",
+                             width, height, "x".join(str(i) for i in dims), scale)
+            image = cv2.resize(image, dims, interpolation=interpln)
+        if pad_to:
+            image = Detector.pad_image(image, pad_to)
+        return image
 
-        if scale < 1.0:
-            logger.trace("Resizing image from %sx%s to %s.",
-                         width, height, "x".join(str(i) for i in dims))
-
-        image = cv2.resize(image, dims, interpolation=interpln)
+    @staticmethod
+    def pad_image(image, target):
+        """ Pad an image to a square """
+        height, width = image.shape[:2]
+        if width < target[0] or height < target[1]:
+            pad_l = (target[0] - width) // 2
+            pad_r = (target[0] - width) - pad_l
+            pad_t = (target[1] - height) // 2
+            pad_b = (target[1] - height) - pad_t
+            img = cv2.copyMakeBorder(  # pylint:disable=no-member
+                image, pad_t, pad_b, pad_l, pad_r,
+                cv2.BORDER_CONSTANT, (0, 0, 0)  # pylint:disable=no-member
+            )
+            return img
         return image
 
     # <<< IMAGE ROTATION METHODS >>> #
@@ -227,8 +259,11 @@ class Detector():
         if rotation.lower() == "on":
             rotation_angles.extend(range(90, 360, 90))
         else:
-            passed_angles = [int(angle)
-                             for angle in rotation.split(",")]
+            passed_angles = [
+                int(angle)
+                for angle in rotation.split(",")
+                if int(angle) != 0
+            ]
             if len(passed_angles) == 1:
                 rotation_step_size = passed_angles[0]
                 rotation_angles.extend(range(rotation_step_size,
@@ -249,8 +284,8 @@ class Detector():
 
     @staticmethod
     def rotate_rect(bounding_box, rotation_matrix):
-        """ Rotate a BoundingBox based on the rotation_matrix"""
-        logger.trace("Rotating BoundingBox")
+        """ Rotate a bounding box dict based on the rotation_matrix"""
+        logger.trace("Rotating bounding box")
         bounding_box = rotate_landmarks(bounding_box, rotation_matrix)
         return bounding_box
 
@@ -317,11 +352,10 @@ class Detector():
         return (exhausted, batch)
 
     # <<< MISC METHODS >>> #
-    @staticmethod
-    def get_vram_free():
+    def get_vram_free(self):
         """ Return free and total VRAM on card with most VRAM free"""
         stats = GPUStats()
-        vram = stats.get_card_most_free()
+        vram = stats.get_card_most_free(supports_plaidml=self.supports_plaidml)
         logger.verbose("Using device %s with %sMB free of %sMB",
                        vram["device"],
                        int(vram["free"]),
@@ -329,11 +363,18 @@ class Detector():
         return int(vram["card_id"]), int(vram["free"]), int(vram["total"])
 
     @staticmethod
-    def set_predetected(width, height):
-        """ Set a BoundingBox for predetected faces """
+    def to_bounding_box_dict(left, top, right, bottom):
+        """ Return a dict for the bounding box """
+        return dict(left=int(round(left)),
+                    right=int(round(right)),
+                    top=int(round(top)),
+                    bottom=int(round(bottom)))
+
+    def set_predetected(self, width, height):
+        """ Set a bounding box dict for predetected faces """
         # Predetected_face is used for sort tool.
         # Landmarks should not be extracted again from predetected faces,
         # because face data is lost, resulting in a large variance
         # against extract from original image
         logger.debug("Setting predetected face")
-        return [BoundingBox(0, 0, width, height)]
+        return [self.to_bounding_box_dict(0, 0, width, height)]

@@ -114,9 +114,10 @@ class Train():
             log = logger.critical
         else:
             msg = ("Exit requested! The trainer will complete its current cycle, "
-                   "save the models and quit (it can take up a couple of seconds "
-                   "depending on your training speed). If you want to kill it now, "
-                   "press Ctrl + c")
+                   "save the models and quit (This can take a couple of minutes "
+                   "depending on your training speed).")
+            if not self.args.redirect_gui:
+                msg += " If you want to kill it now, press Ctrl + c"
             log = logger.info
         log(msg)
         self.stop = True
@@ -133,14 +134,13 @@ class Train():
 
             if self.args.allow_growth:
                 self.set_tf_allow_growth()
-
             model = self.load_model()
             trainer = self.load_trainer(model)
             self.run_training_cycle(model, trainer)
         except KeyboardInterrupt:
             try:
                 logger.debug("Keyboard Interrupt Caught. Saving Weights and exiting")
-                model.save_models(False)
+                model.save_models()
                 trainer.clear_tensorboard()
             except KeyboardInterrupt:
                 logger.info("Saving model weights has been cancelled!")
@@ -153,19 +153,22 @@ class Train():
         logger.debug("Loading Model")
         model_dir = get_folder(self.args.model_dir)
         configfile = self.args.configfile if hasattr(self.args, "configfile") else None
+        augment_color = not self.args.no_augment_color
         model = PluginLoader.get_model(self.trainer_name)(
             model_dir,
-            self.args.gpus,
+            gpus=self.args.gpus,
             configfile=configfile,
+            snapshot_interval=self.args.snapshot_interval,
             no_logs=self.args.no_logs,
             warp_to_landmarks=self.args.warp_to_landmarks,
-            augment_color=self.args.augment_color,
+            augment_color=augment_color,
             no_flip=self.args.no_flip,
             training_image_size=self.image_size,
             alignments_paths=self.alignments_paths,
             preview_scale=self.args.preview_scale,
             pingpong=self.args.pingpong,
             memory_saving_gradients=self.args.memory_saving_gradients,
+            optimizer_savings=self.args.optimizer_savings,
             predict=False)
         logger.debug("Loaded Model")
         return model
@@ -197,7 +200,8 @@ class Train():
         trainer = PluginLoader.get_trainer(model.trainer)
         trainer = trainer(model,
                           self.images,
-                          self.args.batch_size)
+                          self.args.batch_size,
+                          self.args.configfile)
         logger.debug("Loaded Trainer")
         return trainer
 
@@ -211,9 +215,6 @@ class Train():
 
         for iteration in range(0, self.args.iterations):
             logger.trace("Training iteration: %s", iteration)
-            snapshot_iteration = bool(self.args.snapshot_interval != 0 and
-                                      iteration >= self.args.snapshot_interval and
-                                      iteration % self.args.snapshot_interval == 0)
             save_iteration = iteration % self.args.save_interval == 0
             viewer = display_func if save_iteration or self.save_now else None
             timelapse = self.timelapse if save_iteration else None
@@ -224,16 +225,16 @@ class Train():
             if save_iteration:
                 logger.trace("Save Iteration: (iteration: %s", iteration)
                 if self.args.pingpong:
-                    model.save_models(snapshot_iteration)
+                    model.save_models()
                     trainer.pingpong.switch()
                 else:
-                    model.save_models(snapshot_iteration)
+                    model.save_models()
             elif self.save_now:
                 logger.trace("Save Requested: (iteration: %s", iteration)
-                model.save_models(False)
+                model.save_models()
                 self.save_now = False
         logger.debug("Training cycle complete")
-        model.save_models(False)
+        model.save_models()
         trainer.clear_tensorboard()
         self.stop = True
 
@@ -241,13 +242,15 @@ class Train():
         """ Monitor the console, and generate + monitor preview if requested """
         is_preview = self.args.preview
         logger.debug("Launching Monitor")
-        logger.info("R|===============================================")
-        logger.info("R|- Starting                                    -")
+        logger.info("R|===================================================")
+        logger.info("R|  Starting")
         if is_preview:
-            logger.info("R|- Using live preview                          -")
-        logger.info("R|- Press 'ENTER' to save and quit              -")
-        logger.info("R|- Press 'S' to save model weights immediately -")
-        logger.info("R|===============================================")
+            logger.info("R|  Using live preview")
+        logger.info("R|  Press '%s' to save and quit",
+                    "Terminate" if self.args.redirect_gui else "ENTER")
+        if not self.args.redirect_gui:
+            logger.info("R|  Press 'S' to save model weights immediately")
+        logger.info("R|===================================================")
 
         keypress = KBHit(is_gui=self.args.redirect_gui)
         err = False

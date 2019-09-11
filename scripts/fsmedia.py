@@ -10,13 +10,14 @@ import os
 from pathlib import Path
 
 import cv2
+import imageio
 import numpy as np
 
 from lib.aligner import Extract as AlignerExtract
 from lib.alignments import Alignments as AlignmentsBase
 from lib.face_filter import FaceFilter as FilterFunc
-from lib.utils import (camel_case_split, cv2_read_img, get_folder, get_image_paths,
-                       set_system_verbosity, _video_extensions)
+from lib.utils import (camel_case_split, count_frames_and_secs, cv2_read_img, get_folder,
+                       get_image_paths, set_system_verbosity, _video_extensions)
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
@@ -138,15 +139,13 @@ class Images():
         self.args = arguments
         self.is_video = self.check_input_folder()
         self.input_images = self.get_input_images()
+        self.images_found = self.count_images()
         logger.debug("Initialized %s", self.__class__.__name__)
 
-    @property
-    def images_found(self):
+    def count_images(self):
         """ Number of images or frames """
         if self.is_video:
-            cap = cv2.VideoCapture(self.args.input_dir)  # pylint: disable=no-member
-            retval = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))  # pylint: disable=no-member
-            cap.release()
+            retval = int(count_frames_and_secs(self.args.input_dir)[0])
         else:
             retval = len(self.input_images)
         return retval
@@ -157,7 +156,7 @@ class Images():
             logger.error("Input location %s not found.", self.args.input_dir)
             exit(1)
         if (os.path.isfile(self.args.input_dir) and
-                os.path.splitext(self.args.input_dir)[1] in _video_extensions):
+                os.path.splitext(self.args.input_dir)[1].lower() in _video_extensions):
             logger.info("Input Video: %s", self.args.input_dir)
             retval = True
         else:
@@ -193,19 +192,14 @@ class Images():
         """ Return frames from a video file """
         logger.debug("Input is video. Capturing frames")
         vidname = os.path.splitext(os.path.basename(self.args.input_dir))[0]
-        cap = cv2.VideoCapture(self.args.input_dir)  # pylint: disable=no-member
-        i = 0
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                logger.debug("Video terminated")
-                break
-            i += 1
-            # Keep filename format for outputted face
-            filename = "{}_{:06d}.png".format(vidname, i)
+        reader = imageio.get_reader(self.args.input_dir)
+        for i, frame in enumerate(reader):
+            # Convert to BGR for cv2 compatibility
+            frame = frame[:, :, ::-1]
+            filename = "{}_{:06d}.png".format(vidname, i + 1)
             logger.trace("Loading video frame: '%s'", filename)
             yield filename, frame
-        cap.release()
+        reader.close()
 
     def load_one_image(self, filename):
         """ load requested image """
@@ -224,13 +218,10 @@ class Images():
     def load_one_video_frame(self, frame_no):
         """ Load a single frame from a video file """
         logger.trace("Loading video frame: %s", frame_no)
-        cap = cv2.VideoCapture(self.args.input_dir)  # pylint: disable=no-member
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no - 1)  # pylint: disable=no-member
-        ret, frame = cap.read()
-        if not ret:
-            logger.error("Unable to read from %s from video %s", frame_no, self.args.input_dir)
-            exit(1)
-        cap.release()
+        reader = imageio.get_reader(self.args.input_dir)
+        reader.set_image_index(frame_no - 1)
+        frame = reader.get_next_data()[:, :, ::-1]
+        reader.close()
         return frame
 
 
@@ -280,10 +271,20 @@ class PostProcess():
         if ((hasattr(self.args, "filter") and self.args.filter is not None) or
                 (hasattr(self.args, "nfilter") and
                  self.args.nfilter is not None)):
-            face_filter = dict(detector=self.args.detector.replace("-", "_").lower(),
-                               aligner=self.args.aligner.replace("-", "_").lower(),
+
+            if hasattr(self.args, "detector"):
+                detector = self.args.detector.replace("-", "_").lower()
+            else:
+                detector = "cv2_dnn"
+            if hasattr(self.args, "aligner"):
+                aligner = self.args.aligner.replace("-", "_").lower()
+            else:
+                aligner = "cv2_dnn"
+
+            face_filter = dict(detector=detector,
+                               aligner=aligner,
                                loglevel=self.args.loglevel,
-                               multiprocess=self.args.multiprocess)
+                               multiprocess=not self.args.singleprocess)
             filter_lists = dict()
             if hasattr(self.args, "ref_threshold"):
                 face_filter["ref_threshold"] = self.args.ref_threshold
@@ -449,6 +450,7 @@ class FaceFilter(PostProcessAction):
         ret_faces = list()
         for idx, detect_face in enumerate(output_item["detected_faces"]):
             check_item = detect_face["face"] if isinstance(detect_face, dict) else detect_face
+            check_item.load_aligned(output_item["image"])
             if not self.filter.check(check_item):
                 logger.verbose("Skipping not recognized face: (Frame: %s Face %s)",
                                output_item["filename"], idx)

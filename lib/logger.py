@@ -13,7 +13,6 @@ from time import sleep
 from tqdm import tqdm
 
 from lib.queue_manager import queue_manager
-from lib.sysinfo import sysinfo
 
 LOG_QUEUE = queue_manager._log_queue  # pylint: disable=protected-access
 
@@ -137,7 +136,7 @@ def stream_handler(loglevel, is_gui):
 
 
 def crash_handler(log_format):
-    """ Add a handler that sores the last 50 debug lines to 'debug_buffer'
+    """ Add a handler that sores the last 100 debug lines to 'debug_buffer'
         for use in crash reports """
     log_crash = logging.StreamHandler(debug_buffer)
     log_crash.setFormatter(log_format)
@@ -156,6 +155,7 @@ def get_loglevel(loglevel):
 
 def crash_log():
     """ Write debug_buffer to a crash log on crash """
+    from lib.sysinfo import sysinfo
     path = os.getcwd()
     filename = os.path.join(path, datetime.now().strftime("crash_report.%Y.%m.%d.%H%M%S%f.log"))
 
@@ -167,7 +167,7 @@ def crash_log():
     with open(filename, "w") as outfile:
         outfile.writelines(freeze_log)
         traceback.print_exc(file=outfile)
-        outfile.write(sysinfo.full_info())
+        outfile.write(sysinfo)
     return filename
 
 
@@ -186,5 +186,5 @@ logging.setLogRecordFactory(faceswap_logrecord)
 # Set logger class to custom logger
 logging.setLoggerClass(MultiProcessingLogger)
 
-# Stores the last 50 debug messages
-debug_buffer = RollingBuffer(maxlen=50)  # pylint: disable=invalid-name
+# Stores the last 100 debug messages
+debug_buffer = RollingBuffer(maxlen=100)  # pylint: disable=invalid-name
